@@ -1,4 +1,4 @@
-# cdescan 2.1
+# cdescan
 
 cdescan helps you check which services are reachable across network segments,
 whether you're validating PCI segmentation or surveying a large network. It
@@ -16,7 +16,7 @@ Install Python 3.10+, your chosen discovery backend, Nmap, and xsltproc on the
 scan host. Masscan remains the default. For example, on Debian/Kali:
 
 ```sh
-sudo apt install python3 masscan nmap xsltproc
+sudo apt install python3 masscan rustscan nmap xsltproc
 ```
 
 Keep `cdescan.py` and `nmap-bootstrap.xsl` together. Create `targets.txt` with one
