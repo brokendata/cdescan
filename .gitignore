@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+.venv/
+results/
+paused.conf
+targets.txt
+excluded.txt
