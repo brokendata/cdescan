@@ -1,5 +1,6 @@
 import csv
 import json
+import os
 from pathlib import Path
 import sqlite3
 import subprocess
@@ -189,6 +190,145 @@ class ConversionTests(unittest.TestCase):
         run.assert_not_called()
         directory = next((self.path / "results").iterdir())
         self.assertTrue((directory / "endpoint-evidence.csv").is_file())
+
+
+class RustScanTests(unittest.TestCase):
+    setUp = ConversionTests.setUp
+    def test_rustscan_scope_subtraction_and_lazy_batches(self):
+        self.assertEqual(list(scan.effective_ranges(self.scope, self.scope)), [])
+        self.targets.write_text("0.0.0.0/0\n")
+        self.normal.write_text("0.0.0.0/0\n")
+        excluded = self.path / "excluded.txt"
+        excluded.write_text("0.0.0.0/31\n0.0.0.4/30\n")
+        args = scan.parser().parse_args([str(self.targets), "--scanner", "rustscan",
+                                        "--tcp-ports", "443", "--udp-ports", "none", "--batch-size", "3"])
+        jobs = scan.rustscan_jobs(args, self.path, scan.Scope(self.normal), scan.Scope(excluded))
+        first, second = next(jobs), next(jobs)
+        self.assertEqual(first[3], ["0.0.0.2", "0.0.0.3", "0.0.0.8"])
+        self.assertEqual(second[3], ["0.0.0.9", "0.0.0.10", "0.0.0.11"])
+        self.assertNotIn("--udp", first[1])
+
+    def test_rustscan_range_and_mixed_port_arguments(self):
+        self.assertEqual(list(scan.rustscan_port_options("0-65535")), [["--range", "0-65535"]])
+        options = list(scan.rustscan_port_options("0,22,80-82,65535"))
+        self.assertEqual(options, [["--ports", "0,22,80,81,82,65535"]])
+        chunks = list(scan.rustscan_port_options("0-2000,65535"))
+        self.assertTrue(all(len(option[1].split(",")) <= 1000 for option in chunks))
+        selected = [int(value) for option in chunks for value in option[1].split(",")]
+        self.assertEqual(selected, list(range(2001)) + [65535])
+
+    def test_rustscan_protocol_labels_and_duplicate_output(self):
+        path = self.path / "rustscan.stdout"
+        path.write_text("192.0.2.1 -> [53,53]\n\n")
+        hosts = list(scan.rustscan_hosts(path, "udp", ["192.0.2.1"], ["--ports", "53"]))
+        output = self.path / "rustscan.xml"
+        xml(output, hosts)
+        scan.load_discovery(output, self.db, self.scope)
+        self.assertEqual(list(self.db.execute("SELECT * FROM discovered")), [("192.0.2.1", "udp", 53)])
+
+    def test_rustscan_rejects_unexpected_output_hosts_and_ports(self):
+        path = self.path / "rustscan.stdout"
+        for text in ["Open 192.0.2.1:443", "192.0.2.2 -> [443]", "192.0.2.1 -> [80]",
+                     "192.0.2.1 -> [65536]", "192.0.2.1 -> [443,]"]:
+            with self.subTest(text=text):
+                path.write_text(text + "\n")
+                with self.assertRaises(ValueError):
+                    list(scan.rustscan_hosts(path, "tcp", ["192.0.2.1"], ["--ports", "443"]))
+        path.write_text("")
+        self.assertEqual(list(scan.rustscan_hosts(path, "tcp", [], ["--ports", "443"])), [])
+
+    def test_rustscan_rejects_incompatible_source_and_import_options(self):
+        for options in [["--interface", "eth0"], ["--source-ip", "192.0.2.1"],
+                        ["--masscan-xml", "old.xml"], ["--rustscan-tries", "256"],
+                        ["--rustscan-batch-size", "65536"]]:
+            with self.subTest(options=options), self.assertRaises(SystemExit) as error:
+                scan.main([str(self.targets), "--scanner", "rustscan", "--dry-run"] + options)
+            self.assertEqual(error.exception.code, 2)
+
+    def test_environment_backend_selection_and_cli_override(self):
+        with patch.dict(os.environ, {"CDESCAN_SCANNER": "rustscan"}):
+            self.assertEqual(scan.parser().parse_args([str(self.targets)]).scanner, "rustscan")
+            self.assertEqual(scan.parser().parse_args([str(self.targets), "--scanner", "masscan"]).scanner, "masscan")
+        with patch.dict(os.environ, {"CDESCAN_SCANNER": "oops"}), self.assertRaises(SystemExit):
+            scan.main([str(self.targets), "--dry-run"])
+
+    def test_rustscan_dry_run_does_not_launch_processes(self):
+        with patch.object(scan.subprocess, "run") as run:
+            status = scan.main([str(self.targets), "--scanner", "rustscan", "--dry-run",
+                                "--output-dir", str(self.path / "results")])
+        self.assertEqual(status, 0)
+        run.assert_not_called()
+
+    def test_rustscan_requires_fixed_udp_version_before_scanning(self):
+        with patch.object(scan.shutil, "which", return_value="/fake/tool"), patch.object(
+                scan.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "rustscan 2.3.0", "")), patch.object(
+                scan, "run") as run:
+            status = scan.main([str(self.targets), "--scanner", "rustscan", "--skip-html",
+                                "--output-dir", str(self.path / "results")])
+        self.assertEqual(status, 1)
+        run.assert_not_called()
+
+    def test_rustscan_pipeline_through_real_subprocesses_and_xslt(self):
+        binaries = self.path / "bin"
+        binaries.mkdir()
+        # Stand-in executables exercise argv, stdout/stderr separation and real process handling.
+        fixture = '''from pathlib import Path
+import sys
+import xml.etree.ElementTree as ET
+name = Path(sys.argv[0]).name
+args = sys.argv[1:]
+if '--version' in args:
+    print('rustscan 2.4.1' if name == 'rustscan' else 'Nmap fixture 1.0')
+elif name == 'rustscan':
+    assert '--greppable' in args and '--no-config' in args
+    assert args[args.index('--scripts') + 1] == 'none'
+    print('diagnostic fixture', file=sys.stderr)
+    for address in Path(args[args.index('--addresses') + 1]).read_text().splitlines():
+        if '--udp' not in args:
+            print(f'{address} -> [443]')
+        elif address == '192.0.2.2':
+            print(f'{address} -> [53]')
+else:
+    root = ET.Element('nmaprun')
+    for address in Path(args[args.index('-iL') + 1]).read_text().splitlines():
+        h = ET.SubElement(root, 'host')
+        ET.SubElement(h, 'status', state='up')
+        ET.SubElement(h, 'address', addr=address, addrtype='ipv4')
+        ports = ET.SubElement(h, 'ports')
+        assert '-sT' in args
+        ET.SubElement(ET.SubElement(ports, 'port', protocol='tcp', portid='443'), 'state', state='open')
+        if '-sU' in args:
+            assert address == '192.0.2.2'
+            ET.SubElement(ET.SubElement(ports, 'port', protocol='udp', portid='53'), 'state', state='open|filtered')
+    ET.SubElement(ET.SubElement(root, 'runstats'), 'finished', exit='success')
+    ET.ElementTree(root).write(args[args.index('-oX') + 1])
+'''
+        for name in ("rustscan", "nmap"):
+            path = binaries / name
+            path.write_text(f"#!{sys.executable}\n" + fixture)
+            path.chmod(0o755)
+        self.targets.write_text("192.0.2.0/30\n")
+        excluded = self.path / "excluded.txt"
+        excluded.write_text("192.0.2.0\n192.0.2.3\n")
+        with patch.dict(os.environ, {"PATH": str(binaries) + os.pathsep + os.environ["PATH"]}):
+            status = scan.main([str(self.targets), "--scanner", "rustscan", "--tcp-ports", "443",
+                                "--udp-ports", "53", "--exclude-file", str(excluded),
+                                "--output-dir", str(self.path / "results")])
+        self.assertEqual(status, 0)
+        directory = next((self.path / "results").iterdir())
+        manifest = json.loads((directory / "manifest.json").read_text())
+        self.assertEqual(manifest["discovery_backend"], "rustscan")
+        self.assertEqual(manifest["discovered_endpoints"], 3)
+        self.assertEqual(manifest["confirmation_states"], {"open": 2, "open|filtered": 1})
+        self.assertEqual(set(manifest["tools"]), {"rustscan", "nmap", "xsltproc"})
+        self.assertIn("diagnostic fixture", next(directory.glob("rustscan-tcp-*.log")).read_text())
+        self.assertNotIn("diagnostic", next(directory.glob("rustscan-tcp-*.stdout")).read_text())
+        with (directory / "endpoint-evidence.csv").open() as stream:
+            rows = list(csv.DictReader(stream))
+        self.assertTrue(all(row["rustscan_state"] == "open" for row in rows))
+        self.assertFalse((directory / "masscan.xml").exists())
+        self.assertTrue((directory / "rustscan-observations.csv").is_file())
+        self.assertIn("192.0.2.2", (directory / "nmap-bootstrap.html").read_text())
 
 
 if __name__ == "__main__":

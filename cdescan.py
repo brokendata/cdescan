@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
-"""Masscan discovery and host-specific Nmap confirmation. Python 3.10+."""
+"""Selectable Masscan/RustScan discovery and host-specific Nmap confirmation. Python 3.10+."""
 
 import argparse
 import csv
 import hashlib
 import ipaddress
 import json
+import os
+from contextlib import ExitStack
+from itertools import islice
 from pathlib import Path
 import re
 import shlex
@@ -20,7 +23,7 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from xml.sax.saxutils import quoteattr
 
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 STYLESHEET_URL = "https://raw.githubusercontent.com/Haxxnet/nmap-bootstrap-xsl/main/nmap-bootstrap.xsl"
 
 
@@ -83,7 +86,7 @@ def snapshot_targets(source, destination):
             try:
                 network = ipaddress.ip_network(value, strict=False)
                 if network.version != 4:
-                    raise ValueError("this Masscan workflow supports IPv4 only")
+                    raise ValueError("this workflow supports IPv4 only")
             except ValueError as error:
                 raise ValueError(f"{source}:{number}: {error}") from error
             out.write(str(network) + "\n")
@@ -188,14 +191,18 @@ def plans(database, size):
         yield from groups.items()
 
 
-def run(command, directory, manifest, save, label):
+def run(command, directory, manifest, save, label, stdout_name=None):
     record = {"argv": command, "started": now(), "log": f"{label}.log"}
+    if stdout_name:
+        record["stdout"] = stdout_name
     manifest["commands"].append(record)
     save()
     print("+", shlex.join(command), flush=True)
     try:
-        with (directory / record["log"]).open("w") as log:
-            result = subprocess.run(command, cwd=directory, stdout=log, stderr=subprocess.STDOUT,
+        with ExitStack() as stack:
+            log = stack.enter_context((directory / record["log"]).open("w"))
+            output = stack.enter_context((directory / stdout_name).open("w")) if stdout_name else log
+            result = subprocess.run(command, cwd=directory, stdout=output, stderr=log,
                                     check=False)
         record["returncode"] = result.returncode
         if result.returncode:
@@ -203,6 +210,101 @@ def run(command, directory, manifest, save, label):
     finally:
         record["finished"] = now()
         save()
+
+
+def effective_ranges(scope, excluded):
+    """Subtract exclusions before probing, without expanding the scope in memory."""
+    for first, last in scope.ranges:
+        cursor = first
+        if excluded is not None:
+            index = max(0, excluded.search(excluded.starts, first) - 1)
+            for position in range(index, len(excluded.ranges)):
+                lower, upper = excluded.ranges[position]
+                if lower > last:
+                    break
+                if upper < cursor:
+                    continue
+                if lower > cursor:
+                    yield cursor, min(last, lower - 1)
+                cursor = max(cursor, upper + 1)
+                if cursor > last:
+                    break
+        if cursor <= last:
+            yield cursor, last
+
+
+def rustscan_port_options(spec):
+    # Released RustScan 2.4.1 accepts one --range, or a comma-separated --ports.
+    # Bound explicit lists to avoid OS limits on a single command-line argument.
+    if "," not in spec:
+        yield ["--range" if "-" in spec else "--ports", spec]
+        return
+    numbers = (number for part in spec.split(",")
+               for number in range(int(part.split("-")[0]), int(part.split("-")[-1]) + 1))
+    while chunk := list(islice(numbers, 1000)):
+        yield ["--ports", ",".join(map(str, chunk))]
+
+
+def rustscan_jobs(args, directory, scope, excluded):
+    addresses = (str(ipaddress.IPv4Address(number)) for first, last in effective_ranges(scope, excluded)
+                 for number in range(first, last + 1))
+    batch = 0
+    while chunk := list(islice(addresses, args.batch_size)):
+        batch += 1
+        targets = f"rustscan-{batch:06d}.targets"
+        (directory / targets).write_text("\n".join(chunk) + "\n")
+        for protocol, spec in (("tcp", args.tcp_ports), ("udp", args.udp_ports)):
+            if not spec:
+                continue
+            for part, options in enumerate(rustscan_port_options(spec), 1):
+                label = f"rustscan-{protocol}-{batch:06d}-{part:03d}"
+                command = ["rustscan", "--no-config", "--greppable", "--scripts", "none",
+                           "--addresses", targets, "--batch-size", str(args.rustscan_batch_size),
+                           "--timeout", str(args.rustscan_timeout), "--tries", str(args.rustscan_tries)]
+                command += options
+                if protocol == "udp":
+                    command += ["--udp"]
+                yield label, command, protocol, chunk, options
+
+
+def rustscan_hosts(path, protocol, addresses, options):
+    allowed = set(addresses)
+    if options[0] == "--range":
+        lower, upper = map(int, options[1].split("-"))
+        selected = range(lower, upper + 1)
+    else:
+        selected = set(map(int, options[1].split(",")))
+    with path.open() as stream:
+        for line_number, line in enumerate(stream, 1):
+            if not line.strip():
+                continue
+            match = re.fullmatch(r"\s*([0-9.]+)\s*->\s*\[([0-9,\s]*)\]\s*", line)
+            if match is None:
+                raise ValueError(f"{path}:{line_number}: unexpected RustScan greppable output")
+            address = str(ipaddress.IPv4Address(match[1]))
+            if address not in allowed:
+                raise ValueError(f"RustScan returned an address outside its job: {address}")
+            host = ET.Element("host")
+            ET.SubElement(host, "address", addr=address, addrtype="ipv4")
+            container = ET.SubElement(host, "ports")
+            for token in match[2].split(",") if match[2].strip() else []:
+                number = int(token.strip())
+                if number not in selected:
+                    raise ValueError(f"RustScan returned an unrequested port: {number}")
+                port = ET.SubElement(container, "port", protocol=protocol, portid=str(number))
+                ET.SubElement(port, "state", state="open", reason="rustscan-response")
+            yield host
+
+
+def run_rustscan(args, directory, scope, excluded, manifest, save):
+    with (directory / "rustscan.xml").open("wb") as stream:
+        stream.write(b'<?xml version="1.0" encoding="utf-8"?>\n<nmaprun scanner="rustscan">\n')
+        for label, command, protocol, addresses, options in rustscan_jobs(args, directory, scope, excluded):
+            output = f"{label}.stdout"
+            run(command, directory, manifest, save, label, stdout_name=output)
+            for host in rustscan_hosts(directory / output, protocol, addresses, options):
+                stream.write(ET.tostring(host, encoding="utf-8") + b"\n")
+        stream.write(b"</nmaprun>\n")
 
 
 def merge_reports(paths, destination, started):
@@ -242,8 +344,8 @@ def merge_reports(paths, destination, started):
     return counts
 
 
-def export_csv(database, report, directory):
-    with (directory / "masscan-observations.csv").open("w", newline="") as stream:
+def export_csv(database, report, directory, backend="masscan"):
+    with (directory / f"{backend}-observations.csv").open("w", newline="") as stream:
         writer = csv.writer(stream)
         writer.writerow(["ip", "protocol", "port", "state"])
         for row in database.execute("SELECT ip, protocol, port FROM discovered ORDER BY ip, protocol, port"):
@@ -270,7 +372,7 @@ def export_csv(database, report, directory):
     # Preserve a row for EVERY discovered endpoint; don't infer omitted port states.
     with (directory / "endpoint-evidence.csv").open("w", newline="") as stream:
         writer = csv.writer(stream)
-        writer.writerow(["ip", "protocol", "port", "masscan_state", "nmap_state"])
+        writer.writerow(["ip", "protocol", "port", f"{backend}_state", "nmap_state"])
         rows = database.execute("SELECT d.ip,d.protocol,d.port,COALESCE(c.state,'not_individually_reported') "
                                 "FROM discovered d LEFT JOIN confirmed c USING(ip,protocol,port) "
                                 "ORDER BY d.ip,d.protocol,d.port")
@@ -282,18 +384,24 @@ def parser():
     cli = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     cli.add_argument("targets", type=Path, help="IPv4 addresses/CIDRs, one per line; # comments accepted")
     cli.add_argument("--version", action="version", version=VERSION)
+    cli.add_argument("--scanner", choices=("masscan", "rustscan"),
+                     default=os.environ.get("CDESCAN_SCANNER", "masscan"),
+                     help="discovery backend; CDESCAN_SCANNER sets the default")
     cli.add_argument("--output-dir", type=Path, default=Path("results"), help="parent for a unique evidence directory")
-    cli.add_argument("--tcp-ports", type=ports, default="0-65535", help="Masscan TCP ports or none")
-    cli.add_argument("--udp-ports", type=ports, default="0-65535", help="Masscan UDP ports or none")
+    cli.add_argument("--tcp-ports", type=ports, default="0-65535", help="discovery TCP ports or none")
+    cli.add_argument("--udp-ports", type=ports, default="0-65535", help="discovery UDP ports or none")
     cli.add_argument("--rate", type=positive, default=10000, help="Masscan packets/second")
     cli.add_argument("--wait", type=positive, default=10, help="Masscan final response wait in seconds")
+    cli.add_argument("--rustscan-batch-size", type=positive, default=512, help="RustScan concurrent sockets, 1-65535")
+    cli.add_argument("--rustscan-timeout", type=positive, default=1500, help="RustScan response timeout in milliseconds")
+    cli.add_argument("--rustscan-tries", type=positive, default=1, help="RustScan attempts, 1-255")
     cli.add_argument("--exclude-file", type=Path, help="IPv4 addresses/CIDRs to exclude")
-    cli.add_argument("--interface", help="outgoing interface for both scanners")
-    cli.add_argument("--source-ip", type=ipaddress.IPv4Address, help="local source IPv4 for both scanners")
+    cli.add_argument("--interface", help="outgoing interface for Masscan and Nmap; unavailable with RustScan")
+    cli.add_argument("--source-ip", type=ipaddress.IPv4Address, help="local source IPv4 for Masscan and Nmap; unavailable with RustScan")
     cli.add_argument("--source-zone", default="", help="assessment vantage-point label")
     cli.add_argument("--destination-zone", default="", help="destination scope label")
     cli.add_argument("--assessment-id", default="", help="assessment/change/ticket reference")
-    cli.add_argument("--batch-size", type=positive, default=128, help="maximum hosts per Nmap job")
+    cli.add_argument("--batch-size", type=positive, default=128, help="maximum hosts per RustScan or Nmap job")
     cli.add_argument("--tcp-scan", choices=("connect", "syn"), default="connect")
     cli.add_argument("--timing", type=int, choices=range(6), default=4, help="Nmap timing template")
     cli.add_argument("--max-retries", type=int, default=2, help="Nmap retries; nonnegative")
@@ -310,6 +418,14 @@ def parser():
 def main(argv=None):
     cli = parser()
     args = cli.parse_args(argv)
+    if args.scanner not in ("masscan", "rustscan"):
+        cli.error("CDESCAN_SCANNER must be masscan or rustscan")
+    if args.rustscan_batch_size > 65535 or args.rustscan_tries > 255 or args.rustscan_timeout > 4294967295:
+        cli.error("RustScan limits: batch-size <= 65535, tries <= 255, timeout <= 4294967295")
+    if args.scanner == "rustscan" and args.masscan_xml:
+        cli.error("--masscan-xml requires --scanner masscan")
+    if args.scanner == "rustscan" and (args.interface or args.source_ip):
+        cli.error("RustScan does not support --interface/--source-ip here; use OS routing or --scanner masscan")
     if not args.tcp_ports and not args.udp_ports:
         cli.error("at least one protocol must have ports")
     if args.max_retries < 0:
@@ -323,7 +439,7 @@ def main(argv=None):
             setattr(args, name, value.resolve())
     required = [] if args.dry_run else ["nmap"]
     if not args.masscan_xml and not args.dry_run:
-        required.append("masscan")
+        required.append(args.scanner)
     if not args.skip_html and not args.dry_run:
         required.append("xsltproc")
         if not args.stylesheet.is_file():
@@ -337,7 +453,8 @@ def main(argv=None):
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     directory = args.output_dir / f"{stamp}-{uuid.uuid4().hex[:8]}"
     directory.mkdir(parents=True)
-    manifest = {"version": VERSION, "started": now(), "status": "running", "hostname": socket.gethostname(),
+    manifest = {"version": VERSION, "discovery_backend": args.scanner,
+                "started": now(), "status": "running", "hostname": socket.gethostname(),
                 "settings": {key: str(value) if isinstance(value, (Path, ipaddress.IPv4Address)) else value
                              for key, value in vars(args).items()}, "commands": [],
                 "interpretation": "Discovery-led observations only. Silence and open|filtered do not establish "
@@ -358,7 +475,7 @@ def main(argv=None):
         if args.exclude_file:
             snapshot_targets(args.exclude_file, directory / "excluded.txt")
             excluded = Scope(directory / "excluded.txt")
-        discovery = directory / "masscan.xml"
+        discovery = directory / f"{args.scanner}.xml"
         port_spec = ",".join(value for value in
                              (args.tcp_ports, f"U:{args.udp_ports}" if args.udp_ports else "") if value)
         command = ["masscan", "-v", "-p", port_spec, "--rate", str(args.rate),
@@ -372,6 +489,10 @@ def main(argv=None):
         if args.dry_run:
             if args.masscan_xml:
                 print(f"Reuse discovery: {args.masscan_xml}")
+            elif args.scanner == "rustscan":
+                first = next(rustscan_jobs(args, directory, scope, excluded), None)
+                print(shlex.join(first[1]) if first else "No hosts remain after exclusions.")
+                print("Preview of first RustScan job; further host/port/protocol batches follow as needed.")
             else:
                 print(shlex.join(command))
             print("Nmap jobs are determined by discovered host-specific TCP/UDP ports.")
@@ -382,11 +503,17 @@ def main(argv=None):
             result = subprocess.run(probe, capture_output=True, text=True, check=False)
             manifest.setdefault("tools", {})[tool] = {"path": shutil.which(tool),
                                                        "version": (result.stdout + result.stderr).strip()}
+            if tool == "rustscan":
+                version = re.search(r"\b(\d+)\.(\d+)\.(\d+)\b", result.stdout)
+                if result.returncode or version is None or tuple(map(int, version.groups())) < (2, 4, 1):
+                    raise RuntimeError("RustScan 2.4.1+ is required, including its UDP timeout fix")
         if not args.skip_html:
             shutil.copyfile(args.stylesheet, directory / "nmap-bootstrap.xsl")
             manifest["stylesheet_source"] = STYLESHEET_URL if args.stylesheet == parser().get_default("stylesheet") else str(args.stylesheet)
         if args.masscan_xml:
             shutil.copyfile(args.masscan_xml, discovery)
+        elif args.scanner == "rustscan":
+            run_rustscan(args, directory, scope, excluded, manifest, save)
         else:
             run(command, directory, manifest, save, "masscan")
             if (directory / "paused.conf").exists():
@@ -418,7 +545,7 @@ def main(argv=None):
             run(cmd, directory, manifest, save, label)
             outputs.append(directory / f"{label}.xml")
         manifest["nmap_hosts"] = merge_reports(outputs, directory / "nmap.xml", started)
-        export_csv(database, directory / "nmap.xml", directory)
+        export_csv(database, directory / "nmap.xml", directory, args.scanner)
         manifest["confirmation_states"] = dict(database.execute(
             "SELECT COALESCE(c.state,'not_individually_reported'),COUNT(*) "
             "FROM discovered d LEFT JOIN confirmed c USING(ip,protocol,port) "
