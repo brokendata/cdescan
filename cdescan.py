@@ -13,6 +13,7 @@ from pathlib import Path
 import re
 import shlex
 import shutil
+import signal
 import socket
 import sqlite3
 import subprocess
@@ -23,7 +24,7 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from xml.sax.saxutils import quoteattr
 
-VERSION = "2.1.0"
+VERSION = "2.2.0"
 STYLESHEET_URL = "https://raw.githubusercontent.com/Haxxnet/nmap-bootstrap-xsl/main/nmap-bootstrap.xsl"
 
 
@@ -146,11 +147,18 @@ def host_ip(host):
     return str(ipaddress.IPv4Address(address.attrib["addr"]))
 
 
-def load_discovery(path, database, scope, excluded=None):
-    database.execute("CREATE TABLE discovered (ip TEXT, protocol TEXT, port INTEGER, "
+def load_discovery(path, database, scope, excluded=None, allow_partial=False):
+    database.execute("CREATE TABLE IF NOT EXISTS discovered (ip TEXT, protocol TEXT, port INTEGER, "
                      "PRIMARY KEY(ip, protocol, port)) WITHOUT ROWID")
     hosts = 0
-    for host in elements(path, "host"):
+    def observations():
+        try:
+            yield from elements(path, "host")
+        except ET.ParseError:
+            if not allow_partial:
+                raise
+
+    for host in observations():
         address = host_ip(host)
         if address not in scope or (excluded is not None and address in excluded):
             raise ValueError(f"discovery contains an out-of-scope/excluded address: {address}")
@@ -202,11 +210,26 @@ def run(command, directory, manifest, save, label, stdout_name=None):
         with ExitStack() as stack:
             log = stack.enter_context((directory / record["log"]).open("w"))
             output = stack.enter_context((directory / stdout_name).open("w")) if stdout_name else log
-            result = subprocess.run(command, cwd=directory, stdout=output, stderr=log,
-                                    check=False)
-        record["returncode"] = result.returncode
-        if result.returncode:
-            raise RuntimeError(f"{label} exited {result.returncode}; see {directory / record['log']}")
+            with subprocess.Popen(command, cwd=directory, stdout=output, stderr=log,
+                                  start_new_session=True) as process:
+                try:
+                    record["returncode"] = process.wait()
+                except KeyboardInterrupt:
+                    record["interrupted"] = True
+                    print("Stopping scanner gracefully; waiting for output/checkpoint flush...", flush=True)
+                    try:
+                        process.send_signal(signal.SIGINT)
+                        process.wait(timeout=max(30, manifest.get("settings", {}).get("wait", 10) + 15))
+                    except (subprocess.TimeoutExpired, KeyboardInterrupt):
+                        record["forced_stop"] = True
+                        process.kill()
+                        process.wait()
+                    except ProcessLookupError:
+                        pass
+                    record["returncode"] = process.returncode
+                    raise
+        if record["returncode"]:
+            raise RuntimeError(f"{label} exited {record['returncode']}; see {directory / record['log']}")
     finally:
         record["finished"] = now()
         save()
@@ -297,14 +320,24 @@ def rustscan_hosts(path, protocol, addresses, options):
 
 
 def run_rustscan(args, directory, scope, excluded, manifest, save):
-    with (directory / "rustscan.xml").open("wb") as stream:
+    temporary = directory / "rustscan.xml.tmp"
+    with temporary.open("wb") as stream:
         stream.write(b'<?xml version="1.0" encoding="utf-8"?>\n<nmaprun scanner="rustscan">\n')
         for label, command, protocol, addresses, options in rustscan_jobs(args, directory, scope, excluded):
-            output = f"{label}.stdout"
-            run(command, directory, manifest, save, label, stdout_name=output)
+            inputs = {command[command.index("--addresses") + 1]: sha256(directory / command[command.index("--addresses") + 1])}
+            output = cached_job(directory, manifest, label, inputs)
+            if output is None:
+                attempt = next_attempt(manifest, label, inputs, save)
+                output = f"{attempt}.stdout"
+                run(command, directory, manifest, save, attempt, stdout_name=output)
+                # Validate all output before marking this job reusable.
+                for _ in rustscan_hosts(directory / output, protocol, addresses, options):
+                    pass
+                finish_job(directory, manifest, label, output, inputs, save)
             for host in rustscan_hosts(directory / output, protocol, addresses, options):
                 stream.write(ET.tostring(host, encoding="utf-8") + b"\n")
         stream.write(b"</nmaprun>\n")
+    temporary.replace(directory / "rustscan.xml")
 
 
 def merge_reports(paths, destination, started):
@@ -381,8 +414,10 @@ def export_csv(database, report, directory, backend="masscan"):
 
 
 def parser():
-    cli = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    cli.add_argument("targets", type=Path, help="IPv4 addresses/CIDRs, one per line; # comments accepted")
+    cli = argparse.ArgumentParser(description=__doc__, allow_abbrev=False,
+                                  formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    cli.add_argument("targets", type=Path, nargs="?", help="IPv4 addresses/CIDRs; omitted with --resume")
+    cli.add_argument("--resume", type=Path, metavar="RUN_DIR", help="resume an existing cdescan 2.2+ run")
     cli.add_argument("--version", action="version", version=VERSION)
     cli.add_argument("--scanner", choices=("masscan", "rustscan"),
                      default=os.environ.get("CDESCAN_SCANNER", "masscan"),
@@ -415,50 +450,310 @@ def parser():
     return cli
 
 
+RESUME_TUNING = {"rate", "wait", "rustscan_batch_size", "rustscan_timeout", "rustscan_tries",
+                 "timing", "max_retries", "host_timeout"}
+
+
+def evidence_path(directory, name):
+    path = (directory / name).resolve()
+    if Path(name).is_absolute() or not path.is_relative_to(directory):
+        raise ValueError(f"invalid evidence path: {name}")
+    return path
+
+
+def verify_files(directory, hashes):
+    for name, expected in hashes.items():
+        path = evidence_path(directory, name)
+        if not path.is_file() or sha256(path) != expected:
+            raise ValueError(f"missing or changed evidence: {name}; resume stopped")
+
+
+def cached_job(directory, manifest, label, inputs):
+    job = manifest.setdefault("jobs", {}).get(label, {})
+    if not job.get("complete"):
+        return None
+    if job["inputs"] != inputs:
+        raise ValueError(f"job inputs changed: {label}")
+    verify_files(directory, {job["output"]: job["sha256"], **inputs})
+    print(f"= Reusing completed {label}", flush=True)
+    return job["output"]
+
+
+def next_attempt(manifest, label, inputs, save):
+    job = manifest.setdefault("jobs", {}).setdefault(label, {"attempts": 0})
+    job["attempts"] += 1
+    job["complete"] = False
+    job["inputs"] = inputs
+    save()
+    return f"{label}-a{job['attempts']:03d}"
+
+
+def finish_job(directory, manifest, label, output, inputs, save):
+    manifest["jobs"][label].update(complete=True, output=output,
+                                   sha256=sha256(directory / output), inputs=inputs)
+    save()
+
+
+def nmap_completed(path):
+    complete = False
+    for stats in elements(path, "runstats"):
+        finished = stats.find("finished")
+        complete = finished is not None and finished.get("exit") == "success"
+    if not complete:
+        raise RuntimeError(f"Nmap completion marker missing or unsuccessful: {path}")
+
+
+def masscan_command(args, output):
+    spec = ",".join(value for value in
+                    (args.tcp_ports, f"U:{args.udp_ports}" if args.udp_ports else "") if value)
+    command = ["masscan", "-v", "-p", spec, "--rate", str(args.rate), "--wait", str(args.wait),
+               "--open-only", "-iL", "targets.txt", "-oX", output]
+    if args.exclude_file:
+        command += ["--excludefile", "excluded.txt"]
+    if args.interface:
+        command += ["--adapter", args.interface]
+    if args.source_ip:
+        command += ["--adapter-ip", str(args.source_ip)]
+    return command
+
+
+def run_masscan(args, directory, manifest, save):
+    state = manifest["discovery"]
+    parts = state.setdefault("parts", [])
+    if parts and parts[-1].get("complete"):
+        return
+    checkpoint = state.get("resume_config")
+    if parts and not checkpoint:
+        raise RuntimeError("Masscan did not save a usable checkpoint; start a new run. Prior evidence is retained.")
+    if checkpoint:
+        verify_files(directory, {checkpoint: state["resume_sha256"]})
+        # Keep the consumed checkpoint immutable; paused.conf must be free for the next stop.
+        archive = f"masscan-checkpoint-{len(parts):04d}.conf"
+        if checkpoint == "paused.conf":
+            shutil.copyfile(directory / checkpoint, directory / archive)
+            state["resume_config"] = archive
+            save()
+            (directory / checkpoint).unlink()
+            checkpoint = archive
+    label = f"masscan-part-{len(parts) + 1:04d}"
+    output = f"{label}.xml"
+    if checkpoint:
+        command = ["masscan", "--resume", checkpoint, "--rate", str(args.rate),
+                   "--wait", str(args.wait), "--output-append=false", "-oX", output]
+    else:
+        command = masscan_command(args, output)
+    part = {"path": output, "complete": False}
+    parts.append(part)
+    save()
+    try:
+        run(command, directory, manifest, save, label)
+        if (directory / "paused.conf").exists():
+            raise RuntimeError("Masscan paused; use --resume RUN_DIR to continue")
+        part["complete"] = True
+        state.pop("resume_config", None)
+        state.pop("resume_sha256", None)
+    finally:
+        if (directory / output).is_file():
+            part["sha256"] = sha256(directory / output)
+        if (directory / "paused.conf").is_file():
+            state["resume_config"] = "paused.conf"
+            state["resume_sha256"] = sha256(directory / "paused.conf")
+        save()
+
+
+def normalized_discovery(database, path, backend):
+    temporary = path.with_suffix(".xml.tmp")
+    with temporary.open("wb") as stream:
+        stream.write(f'<?xml version="1.0"?><nmaprun scanner="{backend}">\n'.encode())
+        for address, protocol, number in database.execute("SELECT ip,protocol,port FROM discovered ORDER BY ip,protocol,port"):
+            host = ET.Element("host")
+            ET.SubElement(host, "address", addr=address, addrtype="ipv4")
+            port = ET.SubElement(ET.SubElement(host, "ports"), "port", protocol=protocol, portid=str(number))
+            ET.SubElement(port, "state", state="open")
+            stream.write(ET.tostring(host, encoding="utf-8") + b"\n")
+        stream.write(b"</nmaprun>\n")
+    temporary.replace(path)
+
+
+def discovery_database(args, directory, manifest, scope, excluded, save):
+    # Rebuild a derived index; never overwrite raw scanner attempts or a prior published index.
+    scratch = directory / "evidence-rebuild.sqlite3"
+    for suffix in ("", "-journal", "-wal", "-shm"):
+        temporary = Path(str(scratch) + suffix)
+        if temporary.exists():
+            temporary.unlink()
+    database = sqlite3.connect(scratch)
+    state = manifest["discovery"]
+    output = directory / f"{args.scanner}.xml"
+    try:
+        if state.get("complete"):
+            verify_files(directory, {output.name: state["sha256"]})
+            load_discovery(output, database, scope, excluded)
+            return database
+        if args.masscan_xml:
+            if not state.get("imported"):
+                shutil.copyfile(args.masscan_xml, output)
+                state["imported"] = sha256(output)
+                save()
+            verify_files(directory, {output.name: state["imported"]})
+            load_discovery(output, database, scope, excluded)
+        elif args.scanner == "rustscan":
+            run_rustscan(args, directory, scope, excluded, manifest, save)
+            load_discovery(output, database, scope, excluded)
+        else:
+            run_masscan(args, directory, manifest, save)
+            database.execute("CREATE TABLE discovered (ip TEXT, protocol TEXT, port INTEGER, "
+                             "PRIMARY KEY(ip,protocol,port)) WITHOUT ROWID")
+            for part in state["parts"]:
+                if "sha256" not in part:
+                    continue
+                verify_files(directory, {part["path"]: part["sha256"]})
+                path = directory / part["path"]
+                # Masscan may emit an empty file when it observes no open endpoints.
+                if path.stat().st_size:
+                    load_discovery(path, database, scope, excluded, allow_partial=not part["complete"])
+            normalized_discovery(database, output, "masscan")
+        state.update(complete=True, sha256=sha256(output))
+        save()
+        return database
+    except BaseException:
+        database.close()
+        raise
+
+
+def serial_settings(args):
+    return {key: str(value) if isinstance(value, (Path, ipaddress.IPv4Address)) else value
+            for key, value in vars(args).items() if key != "resume"}
+
+
+def restore_run(cli, args, argv):
+    directory = args.resume.resolve()
+    manifest = json.loads((directory / "manifest.json").read_text())
+    if manifest.get("checkpoint_schema") != 1 or manifest.get("status") == "dry-run":
+        raise ValueError("resume requires a real run created by cdescan 2.2+; older runs lack reliable checkpoints")
+    if manifest.get("hostname") != socket.gethostname():
+        raise ValueError("resume must run on the original scan host to preserve the vantage point")
+    if args.targets is not None:
+        raise ValueError("omit the targets argument with --resume; saved scope is reused")
+    explicit = {cli._option_string_actions[token.split("=", 1)[0]].dest for token in argv
+                if token.split("=", 1)[0] in cli._option_string_actions}
+    unsupported = explicit - RESUME_TUNING - {"resume", "dry_run"}
+    if unsupported:
+        raise ValueError("cannot change these settings on resume: " + ", ".join(sorted(unsupported)))
+    overrides = {key: getattr(args, key) for key in RESUME_TUNING & explicit}
+    if manifest["discovery_backend"] == "rustscan" and {"rate", "wait"} & overrides.keys():
+        raise ValueError("--rate/--wait apply to Masscan; tune --rustscan-batch-size for RustScan")
+    if manifest["discovery_backend"] == "masscan" and any(key.startswith("rustscan_") for key in overrides):
+        raise ValueError("RustScan tuning options do not apply to this Masscan run")
+    dry_run = args.dry_run
+    for key, value in manifest["settings"].items():
+        setattr(args, key, value)
+    for key, value in overrides.items():
+        setattr(args, key, value)
+    args.dry_run = dry_run
+    verify_files(directory, manifest["scope_hashes"])
+    state = manifest["discovery"]
+    if state.get("complete"):
+        verify_files(directory, {f"{args.scanner}.xml": state["sha256"]})
+    for part in state.get("parts", []):
+        if "sha256" in part:
+            verify_files(directory, {part["path"]: part["sha256"]})
+    if state.get("resume_config"):
+        verify_files(directory, {state["resume_config"]: state["resume_sha256"]})
+    for job in manifest.get("jobs", {}).values():
+        if job.get("complete"):
+            verify_files(directory, {job["output"]: job["sha256"], **job["inputs"]})
+    args.targets = directory / "targets.txt"
+    args.exclude_file = directory / "excluded.txt" if "excluded.txt" in manifest["scope_hashes"] else None
+    if not args.skip_html:
+        args.stylesheet = directory / "nmap-bootstrap.xsl"
+        if args.native_stylesheet:
+            args.native_stylesheet = directory / "nmap-native.xsl"
+    return directory, manifest, overrides
+
+
 def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
     cli = parser()
     args = cli.parse_args(argv)
-    if args.scanner not in ("masscan", "rustscan"):
-        cli.error("CDESCAN_SCANNER must be masscan or rustscan")
-    if args.rustscan_batch_size > 65535 or args.rustscan_tries > 255 or args.rustscan_timeout > 4294967295:
-        cli.error("RustScan limits: batch-size <= 65535, tries <= 255, timeout <= 4294967295")
-    if args.scanner == "rustscan" and args.masscan_xml:
-        cli.error("--masscan-xml requires --scanner masscan")
-    if args.scanner == "rustscan" and (args.interface or args.source_ip):
-        cli.error("RustScan does not support --interface/--source-ip here; use OS routing or --scanner masscan")
-    if not args.tcp_ports and not args.udp_ports:
-        cli.error("at least one protocol must have ports")
-    if args.max_retries < 0:
-        cli.error("--max-retries must be nonnegative")
-    if args.source_ip and not args.interface:
-        cli.error("--source-ip requires --interface")
-    args.output_dir = args.output_dir.resolve()
-    for name in ("targets", "exclude_file", "masscan_xml", "stylesheet", "native_stylesheet"):
-        value = getattr(args, name)
-        if value is not None:
-            setattr(args, name, value.resolve())
-    required = [] if args.dry_run else ["nmap"]
-    if not args.masscan_xml and not args.dry_run:
-        required.append(args.scanner)
-    if not args.skip_html and not args.dry_run:
-        required.append("xsltproc")
-        if not args.stylesheet.is_file():
-            cli.error(f"missing stylesheet: {args.stylesheet}; obtain {STYLESHEET_URL}")
-        if args.native_stylesheet and not args.native_stylesheet.is_file():
-            cli.error(f"missing native stylesheet: {args.native_stylesheet}")
-    missing = [tool for tool in required if shutil.which(tool) is None]
-    if missing:
-        cli.error("missing executables: " + ", ".join(missing))
+    manifest = None
+    overrides = {}
+    lock = None
+    try:
+        if args.resume:
+            # flock remains held throughout validation, scanning, and manifest updates.
+            import fcntl
+            lock = (args.resume.resolve() / ".cdescan.lock").open("a")
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            directory, manifest, overrides = restore_run(cli, args, argv)
+        elif args.targets is None:
+            cli.error("targets is required unless --resume RUN_DIR is supplied")
+        if args.scanner not in ("masscan", "rustscan"):
+            cli.error("CDESCAN_SCANNER must be masscan or rustscan")
+        if args.rustscan_batch_size > 65535 or args.rustscan_tries > 255 or args.rustscan_timeout > 4294967295:
+            cli.error("RustScan limits: batch-size <= 65535, tries <= 255, timeout <= 4294967295")
+        if args.scanner == "rustscan" and args.masscan_xml:
+            cli.error("--masscan-xml requires --scanner masscan")
+        if args.scanner == "rustscan" and (args.interface or args.source_ip):
+            cli.error("RustScan does not support --interface/--source-ip here; use OS routing or --scanner masscan")
+        if not args.tcp_ports and not args.udp_ports:
+            cli.error("at least one protocol must have ports")
+        if args.max_retries < 0:
+            cli.error("--max-retries must be nonnegative")
+        if args.source_ip and not args.interface:
+            cli.error("--source-ip requires --interface")
+        for name in ("output_dir", "targets", "exclude_file", "masscan_xml", "stylesheet", "native_stylesheet"):
+            value = getattr(args, name)
+            if value is not None:
+                setattr(args, name, Path(value).resolve())
+        if args.source_ip:
+            args.source_ip = ipaddress.IPv4Address(args.source_ip)
+        required = [] if args.dry_run else ["nmap"]
+        if not args.masscan_xml and not args.dry_run and not (manifest and manifest["discovery"].get("complete")):
+            required.append(args.scanner)
+        if not args.skip_html and not args.dry_run:
+            required.append("xsltproc")
+            if not args.stylesheet.is_file():
+                cli.error(f"missing stylesheet: {args.stylesheet}; obtain {STYLESHEET_URL}")
+            if args.native_stylesheet and not args.native_stylesheet.is_file():
+                cli.error(f"missing native stylesheet: {args.native_stylesheet}")
+        missing = [tool for tool in required if shutil.which(tool) is None]
+        if missing:
+            cli.error("missing executables: " + ", ".join(missing))
+        if args.resume and args.dry_run:
+            print(f"Resume {directory}; backend={args.scanner}; tuning changes={overrides}")
+            print("Completed discovery/jobs will be reused; pending or interrupted jobs will continue.")
+            lock.close()
+            return 0
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        if lock is not None:
+            lock.close()
+        cli.error(str(error))
+    except BaseException:
+        if lock is not None:
+            lock.close()
+        raise
 
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    directory = args.output_dir / f"{stamp}-{uuid.uuid4().hex[:8]}"
-    directory.mkdir(parents=True)
-    manifest = {"version": VERSION, "discovery_backend": args.scanner,
-                "started": now(), "status": "running", "hostname": socket.gethostname(),
-                "settings": {key: str(value) if isinstance(value, (Path, ipaddress.IPv4Address)) else value
-                             for key, value in vars(args).items()}, "commands": [],
-                "interpretation": "Discovery-led observations only. Silence and open|filtered do not establish "
-                                  "segmentation. No automatic PCI compliance determination."}
+    if manifest is None:
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        directory = args.output_dir / f"{stamp}-{uuid.uuid4().hex[:8]}"
+        directory.mkdir(parents=True)
+        import fcntl
+        lock = (directory / ".cdescan.lock").open("a")
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        manifest = {"version": VERSION, "checkpoint_schema": 1, "discovery_backend": args.scanner,
+                    "started": now(), "status": "running", "hostname": socket.gethostname(),
+                    "settings": serial_settings(args), "commands": [], "jobs": {}, "discovery": {},
+                    "interpretation": "Discovery-led observations only. Silence and open|filtered do not establish "
+                                      "segmentation. No automatic PCI compliance determination."}
+    else:
+        history = directory / "history"
+        history.mkdir(exist_ok=True)
+        shutil.copyfile(directory / "manifest.json", history / f"manifest-{uuid.uuid4().hex}.json")
+        manifest.setdefault("resumes", []).append({"started": now(), "overrides": overrides, "version": VERSION})
+        manifest["settings"] = serial_settings(args)
+        manifest["status"] = "running"
+        manifest.pop("error", None)
 
     def save():
         temporary = directory / "manifest.json.tmp"
@@ -466,69 +761,64 @@ def main(argv=None):
         temporary.replace(directory / "manifest.json")
 
     database = None
-    started = time.time()
+    started = datetime.fromisoformat(manifest["started"]).timestamp()
     save()
     try:
-        snapshot_targets(args.targets, directory / "targets.txt")
+        if not args.resume:
+            snapshot_targets(args.targets, directory / "targets.txt")
+            if args.exclude_file:
+                snapshot_targets(args.exclude_file, directory / "excluded.txt")
+            if not args.skip_html and not args.dry_run:
+                shutil.copyfile(args.stylesheet, directory / "nmap-bootstrap.xsl")
+                if args.native_stylesheet:
+                    shutil.copyfile(args.native_stylesheet, directory / "nmap-native.xsl")
+            names = ["targets.txt", "excluded.txt", "nmap-bootstrap.xsl", "nmap-native.xsl"]
+            manifest["scope_hashes"] = {name: sha256(directory / name) for name in names if (directory / name).is_file()}
+            save()
         scope = Scope(directory / "targets.txt")
-        excluded = None
-        if args.exclude_file:
-            snapshot_targets(args.exclude_file, directory / "excluded.txt")
-            excluded = Scope(directory / "excluded.txt")
-        discovery = directory / f"{args.scanner}.xml"
-        port_spec = ",".join(value for value in
-                             (args.tcp_ports, f"U:{args.udp_ports}" if args.udp_ports else "") if value)
-        command = ["masscan", "-v", "-p", port_spec, "--rate", str(args.rate),
-                   "--wait", str(args.wait), "--open-only", "-iL", "targets.txt", "-oX", "masscan.xml"]
-        if args.exclude_file:
-            command += ["--excludefile", "excluded.txt"]
-        if args.interface:
-            command += ["--adapter", args.interface]
-        if args.source_ip:
-            command += ["--adapter-ip", str(args.source_ip)]
+        excluded = Scope(directory / "excluded.txt") if args.exclude_file else None
         if args.dry_run:
             if args.masscan_xml:
                 print(f"Reuse discovery: {args.masscan_xml}")
             elif args.scanner == "rustscan":
                 first = next(rustscan_jobs(args, directory, scope, excluded), None)
                 print(shlex.join(first[1]) if first else "No hosts remain after exclusions.")
-                print("Preview of first RustScan job; further host/port/protocol batches follow as needed.")
             else:
-                print(shlex.join(command))
+                print(shlex.join(masscan_command(args, "masscan-part-0001.xml")))
             print("Nmap jobs are determined by discovered host-specific TCP/UDP ports.")
             manifest["status"] = "dry-run"
             return 0
         for tool in required:
-            probe = [tool, "--version"]
-            result = subprocess.run(probe, capture_output=True, text=True, check=False)
+            result = subprocess.run([tool, "--version"], capture_output=True, text=True, check=False)
             manifest.setdefault("tools", {})[tool] = {"path": shutil.which(tool),
                                                        "version": (result.stdout + result.stderr).strip()}
             if tool == "rustscan":
                 version = re.search(r"\b(\d+)\.(\d+)\.(\d+)\b", result.stdout)
                 if result.returncode or version is None or tuple(map(int, version.groups())) < (2, 4, 1):
                     raise RuntimeError("RustScan 2.4.1+ is required, including its UDP timeout fix")
-        if not args.skip_html:
-            shutil.copyfile(args.stylesheet, directory / "nmap-bootstrap.xsl")
-            manifest["stylesheet_source"] = STYLESHEET_URL if args.stylesheet == parser().get_default("stylesheet") else str(args.stylesheet)
-        if args.masscan_xml:
-            shutil.copyfile(args.masscan_xml, discovery)
-        elif args.scanner == "rustscan":
-            run_rustscan(args, directory, scope, excluded, manifest, save)
-        else:
-            run(command, directory, manifest, save, "masscan")
-            if (directory / "paused.conf").exists():
-                raise RuntimeError("Masscan saved paused.conf; discovery is incomplete")
-        database = sqlite3.connect(directory / "evidence.sqlite3")
-        load_discovery(discovery, database, scope, excluded)
+        database = discovery_database(args, directory, manifest, scope, excluded, save)
         manifest["discovered_hosts"] = database.execute("SELECT COUNT(DISTINCT ip) FROM discovered").fetchone()[0]
         manifest["discovered_endpoints"] = database.execute("SELECT COUNT(*) FROM discovered").fetchone()[0]
         save()
         outputs = []
         for index, ((tcp, udp), addresses) in enumerate(plans(database, args.batch_size), 1):
             label = f"nmap-{index:06d}"
-            (directory / f"{label}.targets").write_text("\n".join(addresses) + "\n")
+            targets = f"{label}.targets"
+            expected = "\n".join(addresses) + "\n"
+            path = directory / targets
+            if path.exists() and path.read_text() != expected:
+                raise ValueError(f"job target file changed: {targets}")
+            path.write_text(expected)
+            inputs = {targets: sha256(path)}
+            output = cached_job(directory, manifest, label, inputs)
+            if output is not None:
+                nmap_completed(directory / output)
+                outputs.append(directory / output)
+                continue
+            attempt = next_attempt(manifest, label, inputs, save)
+            output = f"{attempt}.xml"
             cmd = ["nmap", "-Pn", "-n", f"-T{args.timing}", "--max-retries", str(args.max_retries),
-                   "--reason", "-v", "-iL", f"{label}.targets", "-oX", f"{label}.xml"]
+                   "--reason", "-v", "-iL", targets, "-oX", output]
             if tcp:
                 cmd += ["-sT" if args.tcp_scan == "connect" else "-sS"]
             if udp:
@@ -542,21 +832,26 @@ def main(argv=None):
                 cmd += ["--host-timeout", f"{args.host_timeout}s"]
             if args.service_version:
                 cmd += ["-sV"]
-            run(cmd, directory, manifest, save, label)
-            outputs.append(directory / f"{label}.xml")
+            run(cmd, directory, manifest, save, attempt)
+            nmap_completed(directory / output)
+            finish_job(directory, manifest, label, output, inputs, save)
+            outputs.append(directory / output)
         manifest["nmap_hosts"] = merge_reports(outputs, directory / "nmap.xml", started)
         export_csv(database, directory / "nmap.xml", directory, args.scanner)
         manifest["confirmation_states"] = dict(database.execute(
             "SELECT COALESCE(c.state,'not_individually_reported'),COUNT(*) "
             "FROM discovered d LEFT JOIN confirmed c USING(ip,protocol,port) "
             "GROUP BY COALESCE(c.state,'not_individually_reported')"))
+        session = len(manifest.get("resumes", []))
         if not args.skip_html:
             run(["xsltproc", "--nonet", "-o", "nmap-bootstrap.html", "nmap-bootstrap.xsl", "nmap.xml"],
-                directory, manifest, save, "bootstrap-report")
+                directory, manifest, save, f"bootstrap-report-s{session:03d}")
             if args.native_stylesheet:
-                shutil.copyfile(args.native_stylesheet, directory / "nmap-native.xsl")
                 run(["xsltproc", "--nonet", "-o", "nmap-native.html", "nmap-native.xsl", "nmap.xml"],
-                    directory, manifest, save, "native-report")
+                    directory, manifest, save, f"native-report-s{session:03d}")
+        database.close()
+        database = None
+        (directory / "evidence-rebuild.sqlite3").replace(directory / "evidence.sqlite3")
         manifest["status"] = "complete"
         print(f"Evidence and reports: {directory}")
         print("Review both discovery and confirmation evidence; silence is inconclusive.")
@@ -571,13 +866,16 @@ def main(argv=None):
         print(f"ERROR: {error}\nPartial evidence: {directory}", file=sys.stderr)
         return 1
     finally:
-        if database is not None:
-            database.close()
-        manifest["finished"] = now()
-        manifest["sha256"] = {str(path.relative_to(directory)): sha256(path)
-                              for path in directory.rglob("*") if path.is_file()
-                              and path.name not in ("manifest.json", "manifest.json.tmp")}
-        save()
+        try:
+            if database is not None:
+                database.close()
+            manifest["finished"] = now()
+            manifest["sha256"] = {str(path.relative_to(directory)): sha256(path)
+                                  for path in directory.rglob("*") if path.is_file()
+                                  and path.name not in ("manifest.json", "manifest.json.tmp", ".cdescan.lock")}
+            save()
+        finally:
+            lock.close()
 
 
 if __name__ == "__main__":

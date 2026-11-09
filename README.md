@@ -12,8 +12,8 @@ uses only Python's standard library alongside the external scanning tools.
 
 ## Requirements and quick start
 
-Install Python 3.10+, your chosen discovery backend, Nmap, and xsltproc on the
-scan host. Masscan remains the default. For example, on Debian/Kali:
+Use a Linux or macOS scan host with Python 3.10+, your chosen discovery backend,
+Nmap, and xsltproc. Masscan remains the default. For example, on Debian/Kali:
 
 ```sh
 sudo apt install python3 masscan rustscan nmap xsltproc
@@ -133,8 +133,88 @@ Use `--help` for all options. `--masscan-xml` requires `--scanner masscan`.
 Reused discovery is checked against the supplied
 scope and exclusions before confirmation. Imported XML determines the ports
 to confirm; `--tcp-ports` and `--udp-ports` control a new discovery scan only.
-Reuse records a new vantage point and new timestamps; it is not a continuation
-of the previous scan. Results always go into a new directory.
+Importing discovery records a new vantage point and new timestamps; it is not
+a continuation of the previous scan. New runs use a unique directory;
+`--resume` continues inside the existing run directory.
+
+## Pausing, resuming, and lowering speed
+
+Resume is supported for **runs started with cdescan 2.2.0 or later**. Older runs
+do not contain the required checkpoint metadata. Keep the entire run directory
+and resume on the original scan host so the scan vantage point remains the same.
+
+Start a Masscan run at 10,000 packets/second:
+
+```sh
+sudo python3 cdescan.py targets.txt --rate 10000
+```
+
+Press **Ctrl-C once** and let the scanner finish its shutdown. cdescan forwards
+the signal and gives the child time to flush output and save `paused.conf`.
+A second Ctrl-C forces a stop and can prevent checkpoint creation. When ready,
+resume that directory at 1,000 packets/second:
+
+```sh
+sudo python3 cdescan.py --resume results/<run-directory> --rate 1000
+```
+
+Omit the targets argument with `--resume`. The saved scope, exclusions, ports,
+backend, interface/source address, and assessment labels are reused. Omitted
+tuning options retain their last saved values; they do not revert to defaults.
+An explicit `--rate` is passed after Masscan's checkpoint configuration so it
+overrides the previous rate. That rate controls the remaining Masscan discovery
+work, not Nmap jobs or discovery that has already finished.
+
+For a RustScan run, lower socket concurrency instead:
+
+```sh
+sudo python3 cdescan.py --resume results/<rustscan-run> --rustscan-batch-size 128
+```
+
+Nmap's remaining jobs can also use less aggressive timing:
+
+```sh
+sudo python3 cdescan.py --resume results/<run-directory> --timing 2
+```
+
+Allowed tuning overrides are `--rate` and `--wait` for Masscan;
+`--rustscan-batch-size`, `--rustscan-timeout`, and `--rustscan-tries` for RustScan;
+and `--timing`, `--max-retries`, and `--host-timeout` for Nmap. Changes to scope,
+port sets, backend, host batch boundaries, scan mode, and assessment context
+require a new run. `CDESCAN_SCANNER` does not override the saved backend.
+
+To validate the saved evidence and preview resume settings without launching
+scanners or changing the manifest:
+
+```sh
+sudo python3 cdescan.py --resume results/<run-directory> --rate 1000 --dry-run
+```
+
+Resume behavior:
+
+- **Masscan:** resumes from its native checkpoint, writes a separate XML file
+  for each attempt, and combines distinct observations across all attempts.
+  Complete host records from an interrupted/truncated XML file are retained.
+  It does not append XML documents together. If discovery stopped without a
+  usable checkpoint, resume fails explicitly; start a new run instead.
+- **RustScan:** reuses completed discovery jobs and reruns the interrupted or
+  failed job with the new tuning. This is job-level resume, not a native
+  RustScan socket-level checkpoint.
+- **Nmap:** reuses jobs with successful completion markers and unchanged output,
+  and reruns incomplete jobs. Prior attempts remain on disk. Timing overrides
+  affect only jobs still to run, including a retried incomplete job.
+- XML/CSV/HTML summaries are regenerated from the combined evidence. A prior
+  completed run can be resumed to rebuild reports without repeating scanners.
+- The manifest records tuning changes and command history; previous manifests
+  are preserved under `history/`. Scope snapshots, checkpoints, and completed
+  job outputs are hash-checked before reuse. Missing or changed evidence stops
+  resume. A file lock prevents two cdescan processes from resuming the same run.
+
+Do not edit checkpoint files or raw evidence manually. Power loss, `kill -9`,
+or a forced stop cannot guarantee that a native Masscan checkpoint was saved.
+Resumed scans span multiple time windows; use the recorded timestamps when
+interpreting connectivity observations. Routing and remote policy may change
+even when the original scan host is reused.
 
 ## Large-network behavior
 
@@ -163,7 +243,9 @@ Each run creates `results/<UTC timestamp>-<unique suffix>/` containing:
 | File | Purpose |
 | --- | --- |
 | `targets.txt`, `excluded.txt` | Normalized scope snapshots; exclusion file when supplied |
-| `masscan.xml` | Raw discovery XML, or a copy of imported discovery |
+| `masscan.xml` | Combined, deduplicated Masscan discovery XML, or a copy of imported discovery |
+| `masscan-part-*.xml`, `masscan-part-*.log` | Raw Masscan output and log for each initial/resumed attempt |
+| `paused.conf`, `masscan-checkpoint-*.conf` | Current and archived native Masscan checkpoints, when produced |
 | `rustscan-*.targets`, `rustscan-*.stdout`, `rustscan-*.log` | RustScan host batches, raw greppable output, and separate stderr logs |
 | `rustscan.xml` | Normalized RustScan discoveries, labeled by TCP/UDP invocation |
 | `nmap-*.targets`, `nmap-*.xml`, `nmap-*.log` | Exact confirmation batches, raw XML, and scanner logs |
@@ -176,8 +258,12 @@ Each run creates `results/<UTC timestamp>-<unique suffix>/` containing:
 | `endpoint-evidence.csv` | Discovery joined to confirmation; discovery evidence survives confirmation omissions |
 | `evidence.sqlite3` | Disk-backed endpoint index |
 | `manifest.json` | Context, UTC timestamps, settings, tool versions, command arguments, exit codes, outcome, counts, and SHA-256 hashes |
+| `history/manifest-*.json` | Manifest snapshots from before each resume |
 
 Backend-specific discovery files are produced only for the backend used.
+Retried RustScan and Nmap outputs include attempt suffixes such as `-a001` and
+`-a002`; earlier attempts are retained. A temporary `evidence-rebuild.sqlite3`
+may remain after interruption; it is a derived index rebuilt on the next resume.
 `endpoint-evidence.csv` keeps the existing `masscan_state` column in Masscan
 mode and uses `rustscan_state` in RustScan mode. The manifest records
 `discovery_backend`. RustScan output is checked against each job's requested
@@ -195,10 +281,11 @@ provide signed evidence or independent chain of custody.
 Scanner failures, malformed XML, and Ctrl-C retain partial output. Exit codes:
 0 completed workflow or dry run; 1 runtime failure; 2 argument/dependency error;
 130 interrupted. A completed workflow does not mean every host responded.
-Masscan's `paused.conf`, if produced, stays inside that run directory. There is
-no automatic resume; `--masscan-xml` reuses **completed** discovery only.
-A newly produced `paused.conf` is treated as incomplete discovery and stops
-confirmation. Imported XML cannot establish whether its original scope finished.
+Masscan's `paused.conf`, if produced, stays inside that run directory. A paused
+discovery stops confirmation until `--resume` completes discovery. The separate
+`--masscan-xml` option imports **completed** discovery into a new run; it does
+not resume an interrupted scan. Imported XML cannot establish whether its
+original scope finished.
 
 ## Segmentation interpretation
 
@@ -245,7 +332,7 @@ For an update, replace the local XSL with a reviewed upstream revision or pass
 python3 -m unittest discover -s tests -v
 ```
 
-21 tests use synthetic XML and simulated scanners, plus the real local xsltproc
+35 tests use synthetic XML and simulated scanners, plus the real local xsltproc
 for populated and empty reports. They check host-specific batching,
 deduplication, scope/exclusion enforcement, malformed input, ambiguous and
 omitted states, failed/incomplete jobs, and evidence preservation. RustScan
@@ -255,3 +342,7 @@ version checks, stdout/stderr separation, and a complete pipeline using
 stand-in scanner executables through real subprocesses. No live network scans
 are required by the tests. RustScan is not installed in the development
 environment; execution of the actual RustScan binary remains unverified here.
+Resume tests cover rate overrides, repeated pauses, partial XML preservation,
+job reuse, report regeneration, retries, hash checks, locking, read-only preview, and a real child
+process flushing its checkpoint after SIGINT. Native Masscan resume and live
+network scanning remain unverified in the development environment.
