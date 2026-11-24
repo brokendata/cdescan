@@ -98,7 +98,7 @@ are bounded with `--batch-size` (default **128**); jobs run sequentially.
 
 ## 🕰️ History and releases
 
-cdescan began as Chris Timmons's **Bash script, `cdescan.sh` (v1.3)**, heavily
+cdescan began as a bash script, **`cdescan.sh` (v1.3)**, heavily
 adapted from [MassMap](https://github.com/capt-meelo/MassMap). It automated
 Masscan TCP/UDP discovery, extracted hosts and ports with shell tools, passed
 them to Nmap, and generated native and Bootstrap HTML reports. The Python
