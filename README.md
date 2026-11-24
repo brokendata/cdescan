@@ -1,348 +1,129 @@
 # cdescan
 
-cdescan helps you check which services are reachable across network segments,
-whether you're validating PCI segmentation or surveying a large network. It
-combines your choice of Masscan or RustScan discovery with focused Nmap
-follow-up, then brings the results together in a readable HTML report using the
-[Haxxnet stylesheet](https://github.com/Haxxnet/nmap-bootstrap-xsl). Scan logs,
-XML, and CSV exports keep the evidence handy for investigation and reporting.
+🔎 Check which services are reachable across network segments for PCI segmentation
+validation and large-network assessments. cdescan combines Masscan or RustScan
+discovery with focused Nmap confirmation, readable HTML reports, and XML/CSV evidence.
 
-This Python 3.10+ version builds on Chris Timmons's original `cdescan.sh` and
-uses only Python's standard library alongside the external scanning tools.
+## 🚀 Quick start
 
-## Requirements and quick start
-
-Use a Linux or macOS scan host with Python 3.10+, your chosen discovery backend,
-Nmap, and xsltproc. Masscan remains the default. For example, on Debian/Kali:
+Use Linux or macOS with Python 3.10+, Nmap, xsltproc, and your chosen discovery
+backend. Python needs no third-party packages. On Debian/Kali:
 
 ```sh
 sudo apt install python3 masscan rustscan nmap xsltproc
 ```
 
 Keep `cdescan.py` and `nmap-bootstrap.xsl` together. Create `targets.txt` with one
-IPv4 address or CIDR per line. Blank lines and `#` comments are accepted:
+IPv4 address or CIDR per line; blank lines and `#` comments are accepted:
 
 ```text
-# Destination CDE scope
 10.20.0.0/16
 10.30.40.10
 ```
 
-Validate scope and preview discovery without transmitting probes:
-
 ```sh
+# Preview without scanning
 python3 cdescan.py targets.txt --dry-run
-```
 
-Run the original all-port TCP/UDP workflow:
-
-```sh
+# Scan with Masscan (default)
 sudo python3 cdescan.py targets.txt
-```
 
-With Masscan, the defaults discover TCP and UDP ports **0–65535** at **10,000
-packets/second**, then use Nmap TCP connect and UDP scans with `-Pn -n -T4`.
-The final Masscan receive wait is now **10 seconds**, replacing `--wait 0`.
-Nmap retries default to 2; no per-host timeout is imposed unless requested.
-Raw packet operations require the platform's appropriate privileges, usually
-root for Masscan, Nmap UDP, and Nmap SYN scans.
-
-## Selecting RustScan
-
-Install [RustScan 2.4.1 or newer](https://github.com/bee-san/RustScan), then
-select it with a CLI option or environment variable:
-
-```sh
-# All configured TCP/UDP ports, using RustScan for discovery
+# Select RustScan, using the option or an environment variable
 sudo python3 cdescan.py targets.txt --scanner rustscan
-
-# Select through a variable; an explicit --scanner overrides the variable
 sudo env CDESCAN_SCANNER=rustscan python3 cdescan.py targets.txt
-
-# TCP only, with socket concurrency and timeout controls
-sudo python3 cdescan.py targets.txt --scanner rustscan --udp-ports none \
-  --rustscan-batch-size 512 --rustscan-timeout 1500 --rustscan-tries 2
-
-# Switch back to Masscan
-sudo python3 cdescan.py targets.txt --scanner masscan
 ```
 
-Only the selected backend must be installed. Both backends support the same
-`--tcp-ports`, `--udp-ports`, target scope, and exclusions. Set a protocol to
-`none` to skip it. RustScan TCP and UDP discovery run separately; cdescan
-performs the subsequent Nmap confirmation and HTML generation. It disables
-RustScan configuration merging and scripting, so RustScan does not launch its
-own Nmap process or user scripts.
+Defaults scan TCP and UDP ports **0–65535**. Masscan uses **10,000 packets/sec**;
+RustScan requires **2.4.1+** and uses socket concurrency instead of a packet rate.
+Only the selected discovery backend needs to be installed.
 
-RustScan 2.4.1 is the minimum because it includes a fix for UDP timeouts being
-reported as open. Its released CLI has no interface/source-IP binding controls;
-`--interface` and `--source-ip` are rejected in RustScan mode. Use Masscan when
-those controls are required, or configure and independently verify OS routing.
-See the upstream [release](https://github.com/bee-san/RustScan/releases/tag/2.4.1)
-and [CLI source](https://github.com/bee-san/RustScan/blob/2.4.1/src/input.rs).
-
-RustScan uses socket concurrency rather than Masscan's packet-rate control:
-`--rate` and `--wait` apply only to Masscan. RustScan defaults to 512 concurrent
-sockets, a 1500 ms timeout, and one attempt. Long timeouts over large UDP scopes
-can take substantial time. `--batch-size` limits hosts per RustScan job and per
-Nmap job (128 by default); the separate `--rustscan-batch-size` limits concurrent
-sockets. No automatic fallback changes the backend or scan scope.
-
-## Assessment options
-
-Example with assessment context, exclusions, and a lower discovery rate:
+## ⚙️ Common options
 
 ```sh
-sudo python3 cdescan.py targets.txt \
-  --exclude-file excluded.txt \
-  --rate 2000 --wait 15 \
-  --interface eth0 --source-ip 10.10.5.25 \
-  --source-zone corporate --destination-zone CDE \
-  --assessment-id SEG-2026-11 \
-  --output-dir ./results
+# Lower Masscan's rate and apply exclusions
+sudo python3 cdescan.py targets.txt --rate 1000 --exclude-file excluded.txt
+
+# Limit ports, or use --udp-ports none for TCP only
+sudo python3 cdescan.py targets.txt --tcp-ports 22,80,443 --udp-ports 53,161
+
+# Lower RustScan concurrency
+sudo python3 cdescan.py targets.txt --scanner rustscan --rustscan-batch-size 128
+
+# Reuse completed Masscan discovery for fresh Nmap confirmation
+sudo python3 cdescan.py targets.txt --masscan-xml previous/masscan.xml
 ```
 
-`--source-ip` must be an address actually assigned to the selected interface.
-It requires `--interface`. Zone names are evidence labels; they do not change
-routing or discover the true network vantage point. Confirm routing and the
-source seen at the destination independently, particularly across NAT.
+Use `--help` for assessment labels, service/version probes, timing controls,
+and output options. `--interface` and `--source-ip` work with Masscan/Nmap;
+they are unavailable in RustScan mode. `--rate` and `--wait` apply only to Masscan.
 
-Other useful options:
+## ⏸️ Pause and resume
+
+Press **Ctrl-C once** and allow the scanner to finish saving its state. Resume
+on the original scan host, without supplying a targets file:
 
 ```sh
-# TCP only, all TCP ports; no Nmap UDP scan
-sudo python3 cdescan.py targets.txt --udp-ports none
+# Continue a Masscan run at 1,000 packets/sec
+sudo python3 cdescan.py --resume results/RUN_DIRECTORY --rate 1000
 
-# Explicit port subset
-sudo python3 cdescan.py targets.txt --tcp-ports 22,80,443,1433,3389 --udp-ports 53,123,161
+# Continue a RustScan run with lower concurrency
+sudo python3 cdescan.py --resume results/RUN_DIRECTORY --rustscan-batch-size 128
 
-# SYN confirmation with optional active service/version probes
-sudo python3 cdescan.py targets.txt --tcp-scan syn --service-version
-
-# Repeat confirmation using existing discovery, without rerunning Masscan
-sudo python3 cdescan.py targets.txt --masscan-xml /path/to/previous/masscan.xml
-
-# XML/CSV only, without xsltproc or HTML
-sudo python3 cdescan.py targets.txt --skip-html
-
-# Also create native Nmap HTML using an explicitly selected local stylesheet
-sudo python3 cdescan.py targets.txt --native-stylesheet /usr/share/nmap/nmap.xsl
+# Preview a resume without scanning
+sudo python3 cdescan.py --resume results/RUN_DIRECTORY --dry-run
 ```
 
-Use `--help` for all options. `--masscan-xml` requires `--scanner masscan`.
-Reused discovery is checked against the supplied
-scope and exclusions before confirmation. Imported XML determines the ports
-to confirm; `--tcp-ports` and `--udp-ports` control a new discovery scan only.
-Importing discovery records a new vantage point and new timestamps; it is not
-a continuation of the previous scan. New runs use a unique directory;
-`--resume` continues inside the existing run directory.
+Resume requires a run started with **cdescan 2.2.0+**. It preserves earlier
+findings, reuses verified completed jobs, and retries incomplete jobs. Masscan
+uses its native checkpoint; RustScan and Nmap resume at job boundaries.
 
-## Pausing, resuming, and lowering speed
+Keep the entire run directory intact. Saved scope, ports, backend, and scan mode
+cannot change during resume; speed/timing settings can. Masscan needs a usable
+checkpoint—forced stops or power loss may require a new run.
 
-Resume is supported for **runs started with cdescan 2.2.0 or later**. Older runs
-do not contain the required checkpoint metadata. Keep the entire run directory
-and resume on the original scan host so the scan vantage point remains the same.
+## 📁 Results
 
-Start a Masscan run at 10,000 packets/second:
+Each new run gets a directory under `results/` containing HTML reports, XML/CSV
+observations, raw scanner attempts, logs, a SQLite index, and `manifest.json`
+with settings, timestamps, command history, and hashes. Resume continues there
+and retains prior attempts. Use `--skip-html` for XML/CSV-only output.
 
-```sh
-sudo python3 cdescan.py targets.txt --rate 10000
-```
+Hosts share Nmap jobs only when their discovered port sets match. Host batches
+are bounded with `--batch-size` (default **128**); jobs run sequentially.
 
-Press **Ctrl-C once** and let the scanner finish its shutdown. cdescan forwards
-the signal and gives the child time to flush output and save `paused.conf`.
-A second Ctrl-C forces a stop and can prevent checkpoint creation. When ready,
-resume that directory at 1,000 packets/second:
+> **Segmentation evidence:** only discovered endpoints receive Nmap follow-up.
+> Silence does not prove isolation, and ambiguous states remain unresolved.
+> cdescan does not issue a PCI pass/fail decision; validate coverage from the
+> relevant source segments and compare observations with the intended policy.
 
-```sh
-sudo python3 cdescan.py --resume results/<run-directory> --rate 1000
-```
+## 🕰️ History and releases
 
-Omit the targets argument with `--resume`. The saved scope, exclusions, ports,
-backend, interface/source address, and assessment labels are reused. Omitted
-tuning options retain their last saved values; they do not revert to defaults.
-An explicit `--rate` is passed after Masscan's checkpoint configuration so it
-overrides the previous rate. That rate controls the remaining Masscan discovery
-work, not Nmap jobs or discovery that has already finished.
+cdescan began as Chris Timmons's **Bash script, `cdescan.sh` (v1.3)**, heavily
+adapted from [MassMap](https://github.com/capt-meelo/MassMap). It automated
+Masscan TCP/UDP discovery, extracted hosts and ports with shell tools, passed
+them to Nmap, and generated native and Bootstrap HTML reports. The Python
+rewrite kept that practical workflow while adding host-specific confirmation,
+structured evidence, a choice of discovery tools, and resumable runs.
 
-For a RustScan run, lower socket concurrency instead:
-
-```sh
-sudo python3 cdescan.py --resume results/<rustscan-run> --rustscan-batch-size 128
-```
-
-Nmap's remaining jobs can also use less aggressive timing:
-
-```sh
-sudo python3 cdescan.py --resume results/<run-directory> --timing 2
-```
-
-Allowed tuning overrides are `--rate` and `--wait` for Masscan;
-`--rustscan-batch-size`, `--rustscan-timeout`, and `--rustscan-tries` for RustScan;
-and `--timing`, `--max-retries`, and `--host-timeout` for Nmap. Changes to scope,
-port sets, backend, host batch boundaries, scan mode, and assessment context
-require a new run. `CDESCAN_SCANNER` does not override the saved backend.
-
-To validate the saved evidence and preview resume settings without launching
-scanners or changing the manifest:
-
-```sh
-sudo python3 cdescan.py --resume results/<run-directory> --rate 1000 --dry-run
-```
-
-Resume behavior:
-
-- **Masscan:** resumes from its native checkpoint, writes a separate XML file
-  for each attempt, and combines distinct observations across all attempts.
-  Complete host records from an interrupted/truncated XML file are retained.
-  It does not append XML documents together. If discovery stopped without a
-  usable checkpoint, resume fails explicitly; start a new run instead.
-- **RustScan:** reuses completed discovery jobs and reruns the interrupted or
-  failed job with the new tuning. This is job-level resume, not a native
-  RustScan socket-level checkpoint.
-- **Nmap:** reuses jobs with successful completion markers and unchanged output,
-  and reruns incomplete jobs. Prior attempts remain on disk. Timing overrides
-  affect only jobs still to run, including a retried incomplete job.
-- XML/CSV/HTML summaries are regenerated from the combined evidence. A prior
-  completed run can be resumed to rebuild reports without repeating scanners.
-- The manifest records tuning changes and command history; previous manifests
-  are preserved under `history/`. Scope snapshots, checkpoints, and completed
-  job outputs are hash-checked before reuse. Missing or changed evidence stops
-  resume. A file lock prevents two cdescan processes from resuming the same run.
-
-Do not edit checkpoint files or raw evidence manually. Power loss, `kill -9`,
-or a forced stop cannot guarantee that a native Masscan checkpoint was saved.
-Resumed scans span multiple time windows; use the recorded timestamps when
-interpreting connectivity observations. Routing and remote policy may change
-even when the original scan host is reused.
-
-## Large-network behavior
-
-- With Masscan, CIDRs remain compact. For RustScan, exclusions are subtracted
-  first and addresses are expanded lazily into bounded host batches; a large
-  CIDR is never handed to RustScan to expand all at once. Fully excluded scope
-  produces an empty report with no discovery or confirmation jobs.
-- Discovery XML is parsed incrementally into a disk-backed SQLite index,
-  deduplicating repeated IP/protocol/port observations.
-- Nmap jobs group hosts with identical discovered TCP/UDP port sets. Each job
-  contains at most `--batch-size` hosts (default 128). A port found on one host
-  is not automatically scanned on all other hosts.
-- Jobs run sequentially. Highly varied host port sets can create many jobs;
-  SQLite, evidence files, and HTML generation still need disk and memory
-  proportional to the observed results. xsltproc and the HTML browser may be
-  the limiting factors for very large reports; `--skip-html` keeps XML/CSV.
-- `--rate` limits Masscan only. RustScan has its own socket concurrency,
-  timeout, and attempt controls. Nmap uses its own timing/retry controls.
-  `--timing`, `--max-retries`, and `--host-timeout` expose those tradeoffs;
-  aggressive timing and short timeouts can lose evidence.
-
-## Evidence files
-
-Each run creates `results/<UTC timestamp>-<unique suffix>/` containing:
-
-| File | Purpose |
+| Version | What changed |
 | --- | --- |
-| `targets.txt`, `excluded.txt` | Normalized scope snapshots; exclusion file when supplied |
-| `masscan.xml` | Combined, deduplicated Masscan discovery XML, or a copy of imported discovery |
-| `masscan-part-*.xml`, `masscan-part-*.log` | Raw Masscan output and log for each initial/resumed attempt |
-| `paused.conf`, `masscan-checkpoint-*.conf` | Current and archived native Masscan checkpoints, when produced |
-| `rustscan-*.targets`, `rustscan-*.stdout`, `rustscan-*.log` | RustScan host batches, raw greppable output, and separate stderr logs |
-| `rustscan.xml` | Normalized RustScan discoveries, labeled by TCP/UDP invocation |
-| `nmap-*.targets`, `nmap-*.xml`, `nmap-*.log` | Exact confirmation batches, raw XML, and scanner logs |
-| `nmap.xml` | Aggregate confirmation hosts and their port observations |
-| `nmap-bootstrap.html` | Haxxnet HTML report, unless skipped |
-| `nmap-native.html` | Optional native report |
-| `masscan-observations.csv` | Every distinct discovery endpoint |
-| `rustscan-observations.csv` | Every distinct RustScan discovery endpoint, in RustScan mode |
-| `nmap-observations.csv` | Every individually reported confirmation port, including ambiguous/closed/filtered states |
-| `endpoint-evidence.csv` | Discovery joined to confirmation; discovery evidence survives confirmation omissions |
-| `evidence.sqlite3` | Disk-backed endpoint index |
-| `manifest.json` | Context, UTC timestamps, settings, tool versions, command arguments, exit codes, outcome, counts, and SHA-256 hashes |
-| `history/manifest-*.json` | Manifest snapshots from before each resume |
+| **1.3 · Bash** | Original Masscan → Nmap → HTML reporting workflow. |
+| [**2.0.0**](https://github.com/brokendata/cdescan/releases/tag/v2.0.0) | Python rewrite, host-specific batching, Haxxnet reports, and XML/CSV evidence. |
+| [**2.1.0**](https://github.com/brokendata/cdescan/releases/tag/v2.1.0) | Selectable RustScan TCP/UDP discovery and backend-specific tuning. |
+| [**2.2.0**](https://github.com/brokendata/cdescan/releases/tag/v2.2.0) | Resume with speed changes, completed-job reuse, graceful stopping, and evidence checks. |
 
-Backend-specific discovery files are produced only for the backend used.
-Retried RustScan and Nmap outputs include attempt suffixes such as `-a001` and
-`-a002`; earlier attempts are retained. A temporary `evidence-rebuild.sqlite3`
-may remain after interruption; it is a derived index rebuilt on the next resume.
-`endpoint-evidence.csv` keeps the existing `masscan_state` column in Masscan
-mode and uses `rustscan_state` in RustScan mode. The manifest records
-`discovery_backend`. RustScan output is checked against each job's requested
-addresses and ports; malformed or unexpected stdout fails the run and retains
-partial evidence rather than being treated as an empty scan.
+See [CHANGELOG.md](CHANGELOG.md) for full release notes.
 
-The aggregate XML contains host records; per-job XML retains scan metadata,
-task events, and completion markers. HTML host counts describe confirmation
-hosts, not the number of addresses in the original target CIDRs. Some upstream
-tables focus on open ports; use XML and CSV for other states. The aggregate's
-start/finish span is the workflow duration, including discovery. The manifest
-has exact per-command timestamps. Hashes help detect file changes but do not
-provide signed evidence or independent chain of custody.
-
-Scanner failures, malformed XML, and Ctrl-C retain partial output. Exit codes:
-0 completed workflow or dry run; 1 runtime failure; 2 argument/dependency error;
-130 interrupted. A completed workflow does not mean every host responded.
-Masscan's `paused.conf`, if produced, stays inside that run directory. A paused
-discovery stops confirmation until `--resume` completes discovery. The separate
-`--masscan-xml` option imports **completed** discovery into a new run; it does
-not resume an interrupted scan. Imported XML cannot establish whether its
-original scope finished.
-
-## Segmentation interpretation
-
-This preserves the original **discovery-led** design. Endpoints that do not
-answer the selected discovery scanner are not passed to Nmap. It provides positive reachability
-evidence, but an empty scan does not establish isolation: silent services,
-packet loss, host availability, probe payloads, rate limiting, and UDP response
-behavior affect discovery. A port shown as `open|filtered` is unresolved.
-`not_individually_reported` means Nmap omitted the endpoint's explicit state
-(for example, collapsed ports or a timed-out host), not that it was blocked.
-Nmap `-Pn` host status `up` is an assumption, not independent proof of liveness.
-Without `--service-version`, service names can be inferred from port numbers.
-
-For assessment coverage, run from each relevant source segment/direction,
-retain the intended allow/deny matrix, independently validate known live
-listeners and routing, and investigate unexpected observations. This CLI does
-not perform that policy comparison, direct confirmation of undiscovered
-endpoints, IPv6 testing, non-TCP/UDP protocol testing, or application-layer
-segmentation testing. It makes no automatic PCI pass/fail determination.
-
-## Stylesheet provenance
-
-`nmap-bootstrap.xsl` is an unmodified download from:
-
-https://raw.githubusercontent.com/Haxxnet/nmap-bootstrap-xsl/main/nmap-bootstrap.xsl
-
-Retrieved November 9, 2026. SHA-256:
-
-```text
-3bded9dd837b7a829b3b58ea48d04565b1a81461baa510e0c3b9d9f7bcf757e1
-```
-
-Its author notices are preserved, including its stated restriction on military
-or secret-service use. The upstream template loads JavaScript/CSS from public
-CDNs; offline interactive features depend on those assets being available.
-It also includes links to external services. The CLI itself uses the local
-stylesheet and `xsltproc --nonet`; it does not fetch a stylesheet during scans.
-For an update, replace the local XSL with a reviewed upstream revision or pass
-`--stylesheet /path/to/nmap-bootstrap.xsl`. Each run snapshots and hashes it.
-
-## Validation
+## 🧪 Tests and credits
 
 ```sh
 python3 -m unittest discover -s tests -v
 ```
 
-35 tests use synthetic XML and simulated scanners, plus the real local xsltproc
-for populated and empty reports. They check host-specific batching,
-deduplication, scope/exclusion enforcement, malformed input, ambiguous and
-omitted states, failed/incomplete jobs, and evidence preservation. RustScan
-tests additionally cover environment selection, TCP/UDP attribution, lazy
-scope expansion, exclusion subtraction before probing, argument limits,
-version checks, stdout/stderr separation, and a complete pipeline using
-stand-in scanner executables through real subprocesses. No live network scans
-are required by the tests. RustScan is not installed in the development
-environment; execution of the actual RustScan binary remains unverified here.
-Resume tests cover rate overrides, repeated pauses, partial XML preservation,
-job reuse, report regeneration, retries, hash checks, locking, read-only preview, and a real child
-process flushing its checkpoint after SIGINT. Native Masscan resume and live
-network scanning remain unverified in the development environment.
+The 35-test suite covers discovery, reporting, and resume behavior using
+simulated scanners and real XSLT processing. Live scanning and native Masscan
+resume remain unverified in the development environment.
+
+HTML reports use the bundled [Haxxnet nmap-bootstrap-xsl](https://github.com/Haxxnet/nmap-bootstrap-xsl).
+Its upstream notices, including the military/secret-service usage restriction,
+are preserved. Interactive reports load JavaScript/CSS from public CDNs.
